@@ -1,105 +1,228 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { ArrowRight, Bell, CalendarDays, Check, CheckCircle2, ChevronRight, Clock3, Gauge, LayoutDashboard, LogOut, Moon, Plus, RefreshCw, Search, ShieldCheck, Sparkles, Sun, Users, X, PlugZap, FileText, AlertTriangle, UserPlus } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Bell, CalendarDays, Check, CheckCircle2, ChevronRight, Clock3, LayoutDashboard, LogOut, MapPin, Menu, Moon, Plus, RefreshCw, ShieldCheck, Sparkles, Sun, Target, Users, X, Zap } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
+import { useRealtimeCompany } from './hooks/useRealtimeCompany';
+import { explainGeofenceError, getCurrentPosition, isInsideGeofence } from './lib/geofence';
+import './teconnect.css';
 
 const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: true, autoRefreshToken: true } });
 
-const navItems = [
-  { id: 'overview', label: 'Visão geral', icon: LayoutDashboard },
-  { id: 'people', label: 'Pessoas', icon: Users },
-  { id: 'attendance', label: 'Ponto & Horários', icon: Clock3 },
-  { id: 'leaves', label: 'Férias & Ausências', icon: CalendarDays },
-  { id: 'audit', label: 'Auditoria', icon: ShieldCheck },
-  { id: 'integrations', label: 'Integrações', icon: PlugZap },
+const pages = [
+  ['overview', 'Visão geral', LayoutDashboard],
+  ['people', 'Pessoas', Users],
+  ['attendance', 'Ponto & Geofence', Clock3],
+  ['tasks', 'Tarefas RH', CheckCircle2],
+  ['alerts', 'Alertas', AlertTriangle],
+  ['payroll', 'Folha', CalendarDays],
+  ['shifts', 'Turnos', Target],
+  ['integrations', 'Integrações', Zap],
 ];
 
-function initials(name = '') { return name.split(/\s+/).filter(Boolean).slice(0, 2).map((x) => x[0]).join('').toUpperCase() || 'TC'; }
-function useTheme() { const [theme, setTheme] = useState(() => localStorage.getItem('teconnect-theme') || 'dark'); useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('teconnect-theme', theme); }, [theme]); return [theme, setTheme]; }
-async function rpc(name, args = {}) { const { data, error } = await supabase.rpc(name, args); if (error) throw error; return data; }
+const money = (cents = 0) => new Intl.NumberFormat('pt-PT', { style: 'currency', currency: 'EUR' }).format(Number(cents || 0) / 100);
+const minutes = (value = 0) => `${Math.floor(Number(value || 0) / 60)}h ${Number(value || 0) % 60}m`;
+const initials = (name = '') => name.split(/\s+/).filter(Boolean).slice(0, 2).map((x) => x[0]).join('').toUpperCase() || 'TC';
+
+async function rpc(name, args = {}) {
+  const { data, error } = await supabase.rpc(name, args);
+  if (error) throw error;
+  return data;
+}
+
+function useAppData(profile) {
+  const [state, setState] = useState({ employees: [], dashboard: null, approvals: [], anomalies: [], alerts: [], tasks: [], payrollRuns: [], locations: [], shifts: [], assignments: [], loading: true, error: null });
+
+  const load = useCallback(async (silent = false) => {
+    if (!profile?.company_id) return;
+    setState((s) => ({ ...s, loading: silent ? s.loading : true, error: null }));
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const [employees, dashboard, vacations, overtime, adjustments, absences, anomalies, alerts, tasks, payrollRuns, locations, shifts, assignments] = await Promise.all([
+        supabase.from('employees').select('id,employee_code,full_name,email,phone,hire_date,status').eq('company_id', profile.company_id).order('full_name').limit(1000),
+        rpc('get_dashboard_summary', { p_work_date: today }),
+        supabase.from('vacation_requests').select('id,employee_id,start_date,end_date,days,reason,status,created_at').eq('company_id', profile.company_id).eq('status', 'PENDING').order('created_at', { ascending: false }).limit(20),
+        supabase.from('overtime_records').select('id,employee_id,minutes,reason,status,created_at').eq('company_id', profile.company_id).eq('status', 'PENDING').order('created_at', { ascending: false }).limit(20),
+        supabase.from('timesheet_adjustments').select('id,employee_id,work_date,reason,status,created_at').eq('company_id', profile.company_id).eq('status', 'PENDING').order('created_at', { ascending: false }).limit(20),
+        supabase.from('absences').select('id,employee_id,start_date,end_date,reason,status,created_at').eq('company_id', profile.company_id).eq('status', 'PENDING').order('created_at', { ascending: false }).limit(20),
+        supabase.from('attendance_days').select('id,employee_id,work_date,status,late_minutes,early_leave_minutes,overtime_minutes,night_minutes,worked_minutes').eq('company_id', profile.company_id).order('work_date', { ascending: false }).limit(100),
+        supabase.from('hr_alerts').select('id,alert_type,severity,status,title,message,employee_id,score,due_at,created_at').eq('company_id', profile.company_id).in('status', ['OPEN', 'ACKNOWLEDGED']).order('created_at', { ascending: false }).limit(50),
+        supabase.from('hr_tasks').select('id,title,description,status,priority,category,assignee_id,employee_id,due_at,completed_at,created_at,updated_at').eq('company_id', profile.company_id).order('due_at', { ascending: true, nullsFirst: false }).limit(200),
+        supabase.from('payroll_runs').select('id,period_year,period_month,status,employee_count,gross_cents,overtime_cents,night_cents,absence_cents,net_cents,updated_at').eq('company_id', profile.company_id).order('period_year', { ascending: false }).order('period_month', { ascending: false }).limit(12),
+        supabase.from('work_locations').select('id,name,address,latitude,longitude,gps_radius_m,active').eq('company_id', profile.company_id).eq('active', true).order('name'),
+        supabase.from('shifts').select('id,name,start_time,end_time,break_minutes,tolerance_minutes,night_shift,work_days,rotation_code,active').eq('company_id', profile.company_id).eq('active', true).order('start_time'),
+        supabase.from('shift_assignments').select('id,employee_id,shift_id,start_date,end_date').eq('company_id', profile.company_id).order('start_date', { ascending: false }).limit(300),
+      ]);
+      const results = [employees, vacations, overtime, adjustments, absences, anomalies, alerts, tasks, payrollRuns, locations, shifts, assignments];
+      const failure = results.find((r) => r.error)?.error;
+      if (failure) throw failure;
+      const empMap = new Map((employees.data || []).map((e) => [e.id, e]));
+      const approvals = [
+        ...(vacations.data || []).map((r) => ({ ...r, kind: 'vacation', label: 'Férias', employee: empMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.start_date} → ${r.end_date} · ${r.days} dias` })),
+        ...(overtime.data || []).map((r) => ({ ...r, kind: 'overtime', label: 'Horas extra', employee: empMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${minutes(r.minutes)} · ${r.reason || 'Sem observação'}` })),
+        ...(adjustments.data || []).map((r) => ({ ...r, kind: 'adjustment', label: 'Ajuste de ponto', employee: empMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.work_date} · ${r.reason || 'Sem observação'}` })),
+        ...(absences.data || []).map((r) => ({ ...r, kind: 'absence', label: 'Ausência', employee: empMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.start_date} → ${r.end_date} · ${r.reason || 'Sem motivo'}` })),
+      ];
+      setState({ employees: employees.data || [], dashboard: Array.isArray(dashboard) ? dashboard[0] : dashboard, approvals, anomalies: anomalies.data || [], alerts: alerts.data || [], tasks: tasks.data || [], payrollRuns: payrollRuns.data || [], locations: locations.data || [], shifts: shifts.data || [], assignments: assignments.data || [], loading: false, error: null });
+    } catch (error) {
+      console.error(error);
+      setState((s) => ({ ...s, loading: false, error: 'Não foi possível sincronizar os dados da organização.' }));
+    }
+  }, [profile?.company_id]);
+
+  useEffect(() => { load(); }, [load]);
+  return { state, load };
+}
 
 export default function App() {
-  const [theme, setTheme] = useTheme();
-  const [page, setPage] = useState('overview');
-  const [paletteOpen, setPaletteOpen] = useState(false);
-  const [drawerOpen, setDrawerOpen] = useState(false);
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [companyName, setCompanyName] = useState('A sua organização');
-  const [employees, setEmployees] = useState([]);
-  const [dashboard, setDashboard] = useState(null);
-  const [approvals, setApprovals] = useState([]);
-  const [anomalies, setAnomalies] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [error, setError] = useState(null);
+  const [page, setPage] = useState('overview');
+  const [theme, setTheme] = useState(() => localStorage.getItem('teconnect-theme') || 'dark');
+  const [mobileNav, setMobileNav] = useState(false);
   const [toast, setToast] = useState(null);
+  const [command, setCommand] = useState(false);
+  const { state, load } = useAppData(profile);
 
-  const notify = useCallback((message, kind = 'success') => { setToast({ message, kind }); window.setTimeout(() => setToast(null), 2600); }, []);
-
-  const loadAll = useCallback(async () => {
-    setError(null);
-    const [{ data: sessionData }, profileData] = await Promise.all([supabase.auth.getSession(), rpc('get_my_profile')]);
-    const nextSession = sessionData.session;
-    setSession(nextSession);
-    const nextProfile = Array.isArray(profileData) ? profileData[0] : profileData;
-    setProfile(nextProfile || null);
-    if (!nextSession || !nextProfile?.company_id) { setEmployees([]); setDashboard(null); setApprovals([]); setAnomalies([]); return; }
-
-    const [employeeRes, dashRes, vacationRes, overtimeRes, adjustmentsRes, absenceRes, anomalyRes] = await Promise.all([
-      supabase.from('employees').select('id,employee_code,full_name,email,phone,hire_date,status,department_id,position_id').order('full_name').limit(500),
-      rpc('get_dashboard_summary', { p_work_date: new Date().toISOString().slice(0, 10) }),
-      supabase.from('vacation_requests').select('id,employee_id,start_date,end_date,days,reason,status,created_at').eq('status', 'PENDING').order('created_at', { ascending: false }).limit(10),
-      supabase.from('overtime_records').select('id,employee_id,minutes,reason,status,created_at').eq('status', 'PENDING').order('created_at', { ascending: false }).limit(10),
-      supabase.from('timesheet_adjustments').select('id,employee_id,work_date,reason,status,created_at').eq('status', 'PENDING').order('created_at', { ascending: false }).limit(10),
-      supabase.from('absences').select('id,employee_id,start_date,end_date,reason,status,created_at').eq('status', 'PENDING').order('created_at', { ascending: false }).limit(10),
-      supabase.from('attendance_days').select('id,employee_id,work_date,late_minutes,early_leave_minutes,overtime_minutes,status,notes').or('late_minutes.gt.0,early_leave_minutes.gt.0,overtime_minutes.gt.0').order('work_date', { ascending: false }).limit(25),
-    ]);
-    const firstError = [employeeRes, dashRes, vacationRes, overtimeRes, adjustmentsRes, absenceRes, anomalyRes].find((x) => x?.error)?.error;
-    if (firstError) throw firstError;
-
-    setEmployees(employeeRes.data || []);
-    setDashboard(Array.isArray(dashRes) ? dashRes[0] : dashRes || null);
-    const employeeMap = new Map((employeeRes.data || []).map((e) => [e.id, e]));
-    setApprovals([
-      ...(vacationRes.data || []).map((r) => ({ id: r.id, kind: 'vacation', type: 'Férias', employee: employeeMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.start_date} → ${r.end_date} · ${r.days} dias` })),
-      ...(overtimeRes.data || []).map((r) => ({ id: r.id, kind: 'overtime', type: 'Horas extra', employee: employeeMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.minutes} min · ${r.reason || 'Sem observação'}` })),
-      ...(adjustmentsRes.data || []).map((r) => ({ id: r.id, kind: 'adjustment', type: 'Ajuste', employee: employeeMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.work_date} · ${r.reason || 'Ajuste de ponto'}` })),
-      ...(absenceRes.data || []).map((r) => ({ id: r.id, kind: 'absence', type: 'Ausência', employee: employeeMap.get(r.employee_id)?.full_name || 'Colaborador', meta: `${r.start_date} → ${r.end_date} · ${r.reason || 'Sem motivo'}` })),
-    ]);
-    setAnomalies((anomalyRes.data || []).map((r) => ({ id: r.id, severity: r.late_minutes >= 60 || r.early_leave_minutes >= 60 ? 'high' : (r.overtime_minutes >= 120 ? 'medium' : 'low'), title: employeeMap.get(r.employee_id)?.full_name || 'Colaborador', detail: `${r.work_date} · atraso ${r.late_minutes || 0} min · saída antecipada ${r.early_leave_minutes || 0} min · extra ${r.overtime_minutes || 0} min` })));
+  const notify = useCallback((message, kind = 'ok') => {
+    setToast({ message, kind });
+    window.clearTimeout(window.__teconnectToast);
+    window.__teconnectToast = window.setTimeout(() => setToast(null), 3200);
   }, []);
 
-  useEffect(() => { let mounted = true; (async () => { try { await loadAll(); } catch (e) { console.error(e); if (mounted) setError('Não foi possível carregar os dados da organização.'); } finally { if (mounted) setLoading(false); } })(); const { data: listener } = supabase.auth.onAuthStateChange((event, nextSession) => { if (!nextSession) { setSession(null); setProfile(null); setEmployees([]); setDashboard(null); setApprovals([]); return; } if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') loadAll().catch(console.error); }); return () => { mounted = false; listener.subscription.unsubscribe(); }; }, [loadAll]);
-  useEffect(() => { if (profile?.company_id) supabase.from('companies').select('name').eq('id', profile.company_id).single().then(({ data }) => data?.name && setCompanyName(data.name)); }, [profile?.company_id]);
-  useEffect(() => { const onKey = (e) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); setPaletteOpen((v) => !v); } if (e.key === 'Escape') setPaletteOpen(false); }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, []);
+  useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('teconnect-theme', theme); }, [theme]);
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => { if (active) setSession(data.session); });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => setSession(nextSession));
+    return () => { active = false; listener.subscription.unsubscribe(); };
+  }, []);
+  useEffect(() => {
+    if (!session) return;
+    rpc('get_my_profile').then((data) => setProfile(Array.isArray(data) ? data[0] : data)).catch((e) => console.error(e));
+  }, [session]);
 
-  const refresh = async () => { setRefreshing(true); try { await loadAll(); notify('Dados atualizados.'); } catch (e) { console.error(e); notify('Falha ao atualizar os dados.', 'error'); } finally { setRefreshing(false); } };
-  const approve = async (item, approved) => { try { if (item.kind === 'vacation') await rpc('approve_vacation_request', { p_request_id: item.id, p_approve: approved }); else if (item.kind === 'overtime') await rpc('approve_overtime_record', { p_record_id: item.id, p_approve: approved }); else { const { error: e } = await supabase.from('timesheet_adjustments').update({ status: approved ? 'APPROVED' : 'REJECTED', approved_by: profile?.user_id, approved_at: new Date().toISOString() }).eq('id', item.id).eq('status', 'PENDING'); if (e) throw e; } notify(approved ? 'Pedido aprovado.' : 'Pedido rejeitado.'); await refresh(); } catch (e) { console.error(e); notify('Não foi possível concluir esta ação.', 'error'); } };
-  const openPage = (next) => { setPage(next); setPaletteOpen(false); window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const signOut = async () => { await supabase.auth.signOut(); notify('Sessão terminada.'); };
-  if (loading) return <Loading />;
-  if (!session) return <Login />;
-  const activeEmployees = dashboard?.active_employees ?? employees.filter((e) => e.status === 'ACTIVE').length;
-  const pending = dashboard?.pending ?? approvals.length;
-  const attendanceRate = activeEmployees ? Math.round(((dashboard?.present || 0) / activeEmployees) * 1000) / 10 : 0;
+  const realtime = useRealtimeCompany(supabase, profile?.company_id, useCallback(({ table }) => {
+    const critical = ['time_entries', 'attendance_days', 'vacation_requests', 'overtime_records', 'timesheet_adjustments', 'absences', 'hr_alerts', 'hr_tasks', 'hr_task_audit', 'payroll_runs', 'payroll_items', 'notifications', 'picagens'];
+    if (critical.includes(table)) load(true).catch(console.error);
+  }, [load]));
 
-  return <div className="app-shell">
-    <aside className="sidebar"><div className="brand"><div className="brand-mark">T</div><div><strong>Teconnect</strong><span>People OS</span></div></div><div className="workspace"><div className="avatar avatar-sm">{initials(profile?.full_name)}</div><div className="workspace-text"><strong>{companyName}</strong><span>{profile?.role || 'Utilizador'}</span></div><ChevronRight size={16} className="muted" /></div><nav className="nav-stack"><div className="nav-label">Operação</div>{navItems.slice(0, 4).map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${page === id ? 'active' : ''}`} onClick={() => openPage(id)}><Icon size={18} /><span>{label}</span>{id === 'leaves' && pending > 0 && <span className="nav-badge">{pending}</span>}</button>)}<div className="nav-label">Controlo</div>{navItems.slice(4).map(({ id, label, icon: Icon }) => <button key={id} className={`nav-item ${page === id ? 'active' : ''}`} onClick={() => openPage(id)}><Icon size={18} /><span>{label}</span></button>)}</nav><div className="sidebar-bottom"><button className="nav-item" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}>{theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}<span>{theme === 'dark' ? 'Modo claro' : 'Modo escuro'}</span></button><button className="nav-item" onClick={signOut}><LogOut size={18} /><span>Terminar sessão</span></button><div className="secure-chip"><ShieldCheck size={14} /> Sessão protegida</div></div></aside>
-    <main className="main"><header className="topbar"><div className="breadcrumbs"><span>Teconnect</span><ChevronRight size={15} /><strong>{navItems.find((x) => x.id === page)?.label}</strong></div><div className="topbar-actions"><button className="command-trigger" onClick={() => setPaletteOpen(true)}><Search size={17} /><span>Pesquisar ou executar</span><kbd>⌘K</kbd></button><button className="icon-button notification" aria-label="Notificações"><Bell size={18} /></button><div className="avatar">{initials(profile?.full_name)}</div></div></header><div className="content">{error && <div className="card error-banner"><AlertTriangle size={17} /><div><strong>Dados indisponíveis</strong><span>{error}</span></div><button className="button ghost" onClick={refresh}><RefreshCw size={16} /> Tentar novamente</button></div>}{page === 'overview' && <Dashboard active={activeEmployees} pending={pending} attendanceRate={attendanceRate} approvals={approvals} anomalies={anomalies} onNavigate={openPage} onAdd={() => setDrawerOpen(true)} onApprove={approve} refresh={refresh} refreshing={refreshing} />}{page === 'people' && <PeoplePage employees={employees} onAdd={() => setDrawerOpen(true)} />}{page === 'attendance' && <AttendancePage anomalies={anomalies} />}{page === 'leaves' && <ApprovalsPage approvals={approvals} onApprove={approve} />}{page === 'audit' && <AuditPage anomalies={anomalies} dashboard={dashboard} />}{page === 'integrations' && <IntegrationsPage />}</div></main>
-    {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={openPage} onAdd={() => { setDrawerOpen(true); setPaletteOpen(false); }} />}{drawerOpen && <EmployeeDrawer onClose={() => setDrawerOpen(false)} onCreated={async (employee) => { setDrawerOpen(false); notify(`${employee.full_name} foi adicionado.`); await refresh(); }} />}{toast && <div className={`toast ${toast.kind}`}><CheckCircle2 size={17} /><span>{toast.message}</span></div>}<div className="sync-pill"><span className="sync-dot" /> Dados sincronizados</div>
+  const activeEmployees = state.dashboard?.active_employees ?? state.employees.filter((e) => e.status === 'ACTIVE').length;
+  const attendanceRate = Number(state.dashboard?.attendance_rate ?? 0);
+  const operationalRisk = Number(state.dashboard?.risk_operational ?? 0);
+
+  const approve = async (item, accepted) => {
+    try {
+      if (item.kind === 'vacation') await rpc('approve_vacation_request', { p_request_id: item.id, p_approve: accepted });
+      else if (item.kind === 'overtime') await rpc('approve_overtime_record', { p_record_id: item.id, p_approve: accepted });
+      else if (item.kind === 'absence') {
+        const { error } = await supabase.from('absences').update({ status: accepted ? 'APPROVED' : 'REJECTED', approved_by: profile.user_id, approved_at: new Date().toISOString() }).eq('id', item.id).eq('company_id', profile.company_id);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from('timesheet_adjustments').update({ status: accepted ? 'APPROVED' : 'REJECTED', approved_by: profile.user_id }).eq('id', item.id).eq('company_id', profile.company_id);
+        if (error) throw error;
+      }
+      notify(accepted ? 'Pedido aprovado.' : 'Pedido rejeitado.');
+      await load(true);
+    } catch (e) { console.error(e); notify('Não foi possível concluir a decisão.', 'error'); }
+  };
+
+  const signOut = async () => { await supabase.auth.signOut(); setProfile(null); notify('Sessão terminada.'); };
+  if (!session) return <Login onSuccess={setSession} />;
+  if (!profile || state.loading) return <Loading />;
+
+  return <div className="tc-shell">
+    <aside className={`tc-side ${mobileNav ? 'open' : ''}`}>
+      <div className="tc-brand"><div className="tc-brand-mark">T</div><div><strong>Teconnect</strong><span>People OS</span></div></div>
+      <div className="tc-company"><div className="tc-avatar">{initials(profile.full_name)}</div><div className="tc-company-text"><strong>{profile.full_name || 'Utilizador'}</strong><span>{profile.role || 'Utilizador'}</span></div><ChevronRight size={15} className="tc-muted" /></div>
+      <nav className="tc-nav">{pages.map(([id, label, Icon]) => <button key={id} className={page === id ? 'active' : ''} onClick={() => { setPage(id); setMobileNav(false); }}><Icon size={17} /><span>{label}</span>{id === 'alerts' && state.alerts.length > 0 && <span className="tc-muted">{state.alerts.length}</span>}</button>)}</nav>
+      <div className="tc-bottom"><button className="tc-nav" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}><span>{theme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}</span><span>{theme === 'dark' ? 'Modo claro' : 'Modo escuro'}</span></button><button className="tc-nav" onClick={signOut}><span><LogOut size={17} /></span><span>Terminar sessão</span></button><div className="tc-pill"><span className="tc-dot" /> Realtime {realtime.status === 'SUBSCRIBED' ? 'ligado' : 'a ligar'}</div></div>
+    </aside>
+    <main className="tc-main">
+      <header className="tc-top"><button className="tc-btn ghost" onClick={() => setMobileNav((v) => !v)}><Menu size={17} /></button><div className="tc-top-left"><span>Teconnect</span><ChevronRight size={14} /><strong>{pages.find(([id]) => id === page)?.[1]}</strong></div><div className="tc-top-right"><button className="tc-btn ghost" onClick={() => setCommand(true)}>Pesquisar <kbd>⌘K</kbd></button><div className="tc-avatar">{initials(profile.full_name)}</div></div></header>
+      <div className="tc-content">
+        {state.error && <div className="tc-error" style={{ marginBottom: 14, display: 'flex', justifyContent: 'space-between', gap: 10 }}><span>{state.error}</span><button className="tc-btn tc-small" onClick={() => load()}>Tentar novamente</button></div>}
+        {page === 'overview' && <Overview dashboard={state.dashboard} activeEmployees={activeEmployees} attendanceRate={attendanceRate} risk={operationalRisk} approvals={state.approvals} alerts={state.alerts} tasks={state.tasks} onApprove={approve} onNavigate={setPage} onRefresh={() => load()} />}
+        {page === 'people' && <People employees={state.employees} />}
+        {page === 'attendance' && <Attendance profile={profile} locations={state.locations} notify={notify} anomalies={state.anomalies} />}
+        {page === 'tasks' && <Tasks tasks={state.tasks} employees={state.employees} companyId={profile.company_id} userId={profile.user_id} notify={notify} onReload={() => load(true)} />}
+        {page === 'alerts' && <Alerts alerts={state.alerts} employees={state.employees} />}
+        {page === 'payroll' && <Payroll runs={state.payrollRuns} />}
+        {page === 'shifts' && <Shifts shifts={state.shifts} assignments={state.assignments} employees={state.employees} />}
+        {page === 'integrations' && <Integrations />}
+      </div>
+    </main>
+    {command && <CommandPalette onClose={() => setCommand(false)} onNavigate={(next) => { setPage(next); setCommand(false); }} />}
+    {toast && <div className={`tc-pill ${toast.kind === 'error' ? 'tc-no' : 'tc-ok'}`} style={{ position: 'fixed', right: 22, bottom: 22, zIndex: 20, padding: '11px 14px' }}>{toast.kind === 'error' ? <AlertTriangle size={15} /> : <Check size={15} />}{toast.message}</div>}
   </div>;
 }
 
-function Login() { return <div className="loading-screen"><div className="brand-mark large">T</div><strong>Teconnect</strong><span>Inicie sessão para aceder ao espaço da organização.</span></div>; }
-function Loading() { return <div className="loading-screen"><div className="brand-mark large">T</div><strong>A preparar o Teconnect</strong><span>Sincronização segura a iniciar…</span><div className="skeleton-loader" /></div>; }
-function Dashboard({ active, pending, attendanceRate, approvals, anomalies, onNavigate, onAdd, onApprove, refresh, refreshing }) { const stats = [['Pessoas ativas', active, 'base operacional', Users], ['Presenças hoje', `${attendanceRate}%`, 'presença calculada', Clock3], ['Pendências', pending, 'requerem decisão', CheckCircle2], ['Sinais de atenção', anomalies.length, 'anomalias recentes', Gauge]]; return <><section className="page-hero"><div><div className="eyebrow"><Sparkles size={14} /> Centro de comando</div><h1>Bom dia. Vamos pôr a operação em ordem.</h1><p>Dados reais da organização, decisões rápidas e uma visão operacional num só lugar.</p></div><div className="hero-actions"><button className="button ghost" onClick={refresh}><RefreshCw size={16} className={refreshing ? 'spin' : ''} /> Atualizar</button><button className="button primary" onClick={onAdd}><Plus size={17} /> Adicionar pessoa</button></div></section><div className="stat-grid">{stats.map(([label, value, foot, Icon]) => <div className="stat-card" key={label}><div className="stat-top"><span>{label}</span><Icon size={17} /></div><div className="stat-value">{value}</div><div className="stat-foot"><strong>Live</strong><span>{foot}</span></div></div>)}</div><div className="section-heading"><div><h2>Ações instantâneas</h2><span>{approvals.length} itens em fila</span></div><button className="text-button" onClick={() => onNavigate('leaves')}>Ver fila completa <ArrowRight size={15} /></button></div><div className="two-col"><section className="card"><div className="card-header"><div><span className="section-kicker">Aprovações</span><h3>Resolva em 1 clique</h3></div><div className="mini-count">{approvals.length}</div></div><div className="approval-list">{approvals.length ? approvals.slice(0, 6).map((item) => <div className="approval-item" key={`${item.kind}-${item.id}`}><div className="approval-icon"><FileText size={17} /></div><div className="approval-copy"><strong>{item.employee}</strong><span>{item.type} · {item.meta}</span></div><div className="approval-actions"><button className="icon-button success" aria-label="Aprovar" onClick={() => onApprove(item, true)}><Check size={16} /></button><button className="icon-button danger" aria-label="Rejeitar" onClick={() => onApprove(item, false)}><X size={16} /></button></div></div>) : <EmptyState title="Fila limpa" text="Não há decisões pendentes neste momento." />}</div></section><section className="card"><div className="card-header"><div><span className="section-kicker">Auditoria preditiva</span><h3>Sinais reais da operação</h3></div><span className="risk-badge"><span /> {anomalies.length ? 'atenção necessária' : 'risco baixo'}</span></div><div className="anomaly-list">{anomalies.slice(0, 5).map((item) => <div className="anomaly-item" key={item.id}><div className={`severity ${item.severity}`} /><div><strong>{item.title}</strong><span>{item.detail}</span></div><ArrowRight size={14} className="muted" /></div>)}{!anomalies.length && <EmptyState title="Sem anomalias recentes" text="Nenhum sinal operacional relevante foi encontrado no período carregado." />}</div><button className="wide-secondary" onClick={() => onNavigate('audit')}><ShieldCheck size={16} /> Abrir centro de auditoria</button></section></div></>; }
-function PeoplePage({ employees, onAdd }) { const [q, setQ] = useState(''); const filtered = useMemo(() => employees.filter((e) => `${e.full_name} ${e.employee_code} ${e.email || ''}`.toLowerCase().includes(q.toLowerCase())), [employees, q]); return <><section className="page-hero"><div><div className="eyebrow"><Users size={14} /> Pessoas</div><h1>A sua organização, sem ruído.</h1><p>Lista sincronizada diretamente com o PostgreSQL da organização.</p></div><button className="button primary" onClick={onAdd}><UserPlus size={17} /> Novo colaborador</button></section><section className="card"><div className="table-toolbar"><div className="search-box"><Search size={16} /><input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Pesquisar pessoas…" /></div><span>{filtered.length} resultados</span></div><div className="people-table">{filtered.map((e) => <div className="person-row" key={e.id}><div className="avatar">{initials(e.full_name)}</div><div><strong>{e.full_name}</strong><span>{e.employee_code} · {e.email || 'Sem email'}</span></div><span className={`status-pill ${String(e.status).toLowerCase()}`}>{e.status}</span></div>)}{!filtered.length && <EmptyState title="Sem pessoas" text="Não existem colaboradores para mostrar nesta organização." />}</div></section></>; }
-function AttendancePage({ anomalies }) { return <><section className="page-hero"><div><div className="eyebrow"><Clock3 size={14} /> Ponto & Horários</div><h1>O pulso operacional.</h1><p>Anomalias calculadas a partir do registo de assiduidade real.</p></div></section><section className="card"><div className="card-header"><div><span className="section-kicker">Análise</span><h3>Anomalias de assiduidade</h3></div><span className="mini-count">{anomalies.length}</span></div><div className="anomaly-list">{anomalies.map((a) => <div className="anomaly-item" key={a.id}><div className={`severity ${a.severity}`} /><div><strong>{a.title}</strong><span>{a.detail}</span></div></div>)}{!anomalies.length && <EmptyState title="Sem sinais" text="Não há anomalias nas marcações carregadas." />}</div></section></>; }
-function ApprovalsPage({ approvals, onApprove }) { return <><section className="page-hero"><div><div className="eyebrow"><CalendarDays size={14} /> Aprovações</div><h1>Decida sem navegar.</h1><p>As solicitações são lidas diretamente das tabelas operacionais com isolamento por empresa.</p></div></section><section className="card"><div className="approval-list">{approvals.map((item) => <div className="approval-item" key={`${item.kind}-${item.id}`}><div className="approval-icon"><CalendarDays size={17} /></div><div className="approval-copy"><strong>{item.employee}</strong><span>{item.type} · {item.meta}</span></div><div className="approval-actions"><button className="button primary small" onClick={() => onApprove(item, true)}>Aprovar</button><button className="button ghost small" onClick={() => onApprove(item, false)}>Rejeitar</button></div></div>)}{!approvals.length && <EmptyState title="Tudo em dia" text="Não existem aprovações pendentes." />}</div></section></>; }
-function AuditPage({ anomalies, dashboard }) { return <><section className="page-hero"><div><div className="eyebrow"><ShieldCheck size={14} /> Auditoria</div><h1>Conformidade orientada por dados.</h1><p>O centro de controlo usa apenas informação real do período atual.</p></div></section><div className="stat-grid"><div className="stat-card"><div className="stat-top"><span>Presenças</span><CheckCircle2 size={17} /></div><div className="stat-value">{dashboard?.present ?? 0}</div><div className="stat-foot"><span>hoje</span></div></div><div className="stat-card"><div className="stat-top"><span>Atrasos</span><AlertTriangle size={17} /></div><div className="stat-value">{dashboard?.late ?? 0}</div><div className="stat-foot"><span>ocorrências</span></div></div><div className="stat-card"><div className="stat-top"><span>Ausências</span><CalendarDays size={17} /></div><div className="stat-value">{dashboard?.absent ?? 0}</div><div className="stat-foot"><span>estimadas</span></div></div><div className="stat-card"><div className="stat-top"><span>Sinais</span><Gauge size={17} /></div><div className="stat-value">{anomalies.length}</div><div className="stat-foot"><span>recentes</span></div></div></div></>; }
-function IntegrationsPage() { const items = [['SAP SuccessFactors', 'OData / APIs'], ['PHC', 'REST / SOAP'], ['PRIMAVERA', 'Integration Server'], ['Oracle', 'Gateway seguro / ORDS']]; return <><section className="page-hero"><div><div className="eyebrow"><PlugZap size={14} /> Integrações enterprise</div><h1>Conecte o ecossistema da empresa.</h1><p>As integrações externas correm por gateways e jobs assíncronos, nunca pelo browser.</p></div></section><div className="two-col">{items.map(([name, protocol]) => <section className="card integration-card" key={name}><div className="integration-icon"><PlugZap size={20} /></div><h3>{name}</h3><span>{protocol}</span><strong>Preparado para ligação</strong></section>)}</div></>; }
-function EmployeeDrawer({ onClose, onCreated }) { const [form, setForm] = useState({ employee_code: '', full_name: '', email: '', phone: '', nif: '', hire_date: '' }); const [saving, setSaving] = useState(false); const submit = async (e) => { e.preventDefault(); setSaving(true); try { const id = await rpc('create_employee_app', { p_employee_code: form.employee_code, p_full_name: form.full_name, p_email: form.email || null, p_phone: form.phone || null, p_nif: form.nif || null, p_hire_date: form.hire_date || null }); await onCreated({ id, ...form, status: 'ACTIVE' }); } catch (err) { console.error(err); } finally { setSaving(false); } }; return <div className="modal-backdrop"><form className="drawer" onSubmit={submit}><div className="drawer-header"><div><span className="section-kicker">Admissão</span><h3>Novo colaborador</h3></div><button type="button" className="icon-button" onClick={onClose}><X size={18} /></button></div><div className="form-grid">{Object.entries(form).map(([key, value]) => <label key={key}>{key === 'full_name' ? 'Nome completo' : key.replace('_', ' ')}<input type={key === 'hire_date' ? 'date' : 'text'} value={value} onChange={(e) => setForm((f) => ({ ...f, [key]: e.target.value }))} required={['employee_code', 'full_name'].includes(key)} /></label>)}</div><div className="drawer-footer"><button type="button" className="button ghost" onClick={onClose}>Cancelar</button><button className="button primary" disabled={saving}>{saving ? 'A criar…' : 'Criar colaborador'}</button></div></form></div>; }
-function CommandPalette({ onClose, onNavigate, onAdd }) { const [q, setQ] = useState(''); const actions = [['Ir para Visão geral', 'overview', () => onNavigate('overview')], ['Abrir Pessoas', 'people', () => onNavigate('people')], ['Abrir Ponto & Horários', 'attendance', () => onNavigate('attendance')], ['Abrir Férias & Ausências', 'leaves', () => onNavigate('leaves')], ['Abrir Auditoria', 'audit', () => onNavigate('audit')], ['Abrir Integrações', 'integrations', () => onNavigate('integrations')], ['Cadastrar colaborador', 'people+', onAdd]]; const filtered = actions.filter(([label]) => label.toLowerCase().includes(q.toLowerCase())); return <div className="modal-backdrop" onMouseDown={onClose}><div className="command-modal" onMouseDown={(e) => e.stopPropagation()}><div className="command-search"><Search size={18} /><input autoFocus value={q} onChange={(e) => setQ(e.target.value)} placeholder="O que pretende fazer?" /></div><div className="command-list">{filtered.map(([label, key, action]) => <button key={key} onClick={action}><ArrowRight size={16} /><span>{label}</span></button>)}</div></div></div>; }
-function EmptyState({ title, text }) { return <div className="empty-state"><Sparkles size={18} /><strong>{title}</strong><span>{text}</span></div>; }
+function Login({ onSuccess }) {
+  const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); const [error, setError] = useState(''); const [busy, setBusy] = useState(false);
+  const submit = async (e) => { e.preventDefault(); setBusy(true); setError(''); const { data, error: authError } = await supabase.auth.signInWithPassword({ email, password }); if (authError) setError(authError.message || 'Credenciais inválidas.'); else onSuccess(data.session); setBusy(false); };
+  return <div className="tc-login"><div className="tc-card tc-login-card"><div className="tc-brand"><div className="tc-brand-mark">T</div><div><strong>Teconnect</strong><span>People OS</span></div></div><h1 style={{ fontSize: 25, margin: '22px 0 7px' }}>Acesso corporativo</h1><p className="tc-muted" style={{ lineHeight: 1.6 }}>Entre para gerir pessoas, ponto, turnos, tarefas, alertas e operações de RH.</p>{error && <div className="tc-error" style={{ marginBottom: 12 }}>{error}</div>}<form className="tc-form" onSubmit={submit}><label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} required autoComplete="email" /></label><label>Palavra-passe<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required autoComplete="current-password" /></label><button className="tc-btn primary" disabled={busy}>{busy ? 'A entrar…' : 'Entrar'}</button></form></div></div>;
+}
+
+function Loading() { return <div className="tc-loading"><div><div className="tc-brand-mark" style={{ margin: '0 auto 12px' }}>T</div><strong>A sincronizar o Teconnect…</strong></div></div>; }
+
+function Overview({ dashboard, activeEmployees, attendanceRate, risk, approvals, alerts, tasks, onApprove, onNavigate, onRefresh }) {
+  const stats = [
+    ['Headcount ativo', activeEmployees, Users, 'colaboradores'],
+    ['Assiduidade', `${attendanceRate.toFixed(1)}%`, Clock3, 'hoje'],
+    ['Horas extra', minutes(dashboard?.overtime_minutes_week), Zap, 'últimos 7 dias'],
+    ['Horas noturnas', minutes(dashboard?.night_minutes_week), Moon, 'últimos 7 dias'],
+    ['Férias disponíveis', Number(dashboard?.vacation_days_available || 0).toFixed(1), CalendarDays, 'saldo global'],
+    ['Risco operacional', `${risk.toFixed(0)}/100`, AlertTriangle, risk >= 70 ? 'atenção imediata' : 'controlado'],
+  ];
+  return <>
+    <section className="tc-hero"><div><div className="tc-eyebrow"><Sparkles size={13} /> Executive People Command</div><h1>Painel executivo</h1><p>Operação de RH em tempo real, com decisões e sinais críticos no mesmo fluxo.</p></div><div className="tc-actions"><button className="tc-btn" onClick={onRefresh}><RefreshCw size={15} /> Sincronizar</button><button className="tc-btn primary" onClick={() => onNavigate('tasks')}><Plus size={15} /> Nova tarefa</button></div></section>
+    <div className="tc-grid-6">{stats.map(([label, value, Icon, foot]) => <div className="tc-card tc-kpi" key={label}><div className="tc-kpi-top"><span>{label}</span><Icon size={15} /></div><div className="tc-kpi-value">{value}</div><div className="tc-kpi-foot">{foot}</div></div>)}</div>
+    <div className="tc-two tc-section"><section className="tc-card tc-card-pad"><div className="tc-section-head"><div><h2>Decisões pendentes</h2><span>{approvals.length} itens</span></div><button className="tc-btn tc-small" onClick={() => onNavigate('alerts')}>Alertas <ArrowRight size={13} /></button></div>{approvals.length === 0 ? <div className="tc-empty">A fila está limpa.</div> : <div className="tc-list">{approvals.slice(0, 8).map((item) => <div className="tc-row" key={`${item.kind}-${item.id}`}><div className="tc-row-main"><div className="tc-row-title">{item.employee} · {item.label}</div><div className="tc-row-sub">{item.meta}</div></div><div className="tc-actions"><button className="tc-btn tc-small" onClick={() => onApprove(item, false)}>Rejeitar</button><button className="tc-btn primary tc-small" onClick={() => onApprove(item, true)}><Check size={13} /> Aprovar</button></div></div>)}</div>}</section>
+    <section className="tc-card tc-card-pad"><div className="tc-section-head"><div><h2>Alertas preditivos</h2><span>{alerts.length} abertos</span></div><button className="tc-btn tc-small" onClick={() => onNavigate('alerts')}>Ver todos</button></div>{alerts.length === 0 ? <div className="tc-empty">Sem alertas críticos neste momento.</div> : alerts.slice(0, 6).map((a) => <div className="tc-alert" key={a.id}><div><div className="tc-alert-title">{a.title}</div><div className="tc-alert-msg">{a.message}</div></div><span className={`tc-badge ${String(a.severity).toLowerCase()}`}>{a.severity}</span></div>)}</section></div>
+    <div className="tc-section"><div className="tc-section-head"><div><h2>Fila de tarefas RH</h2><span>{tasks.filter((t) => t.status !== 'DONE' && t.status !== 'CANCELLED').length} abertas</span></div><button className="tc-btn tc-small" onClick={() => onNavigate('tasks')}>Abrir kanban <ArrowRight size={13} /></button></div></div>
+  </>;
+}
+
+function People({ employees }) { return <><section className="tc-hero"><div><div className="tc-eyebrow"><Users size={13} /> Pessoas</div><h1>Colaboradores</h1><p>Base operacional ligada diretamente ao tenant Supabase.</p></div></section><section className="tc-card tc-card-pad"><table className="tc-table"><thead><tr><th>Colaborador</th><th>Código</th><th>Email</th><th>Admissão</th><th>Estado</th></tr></thead><tbody>{employees.map((e) => <tr key={e.id}><td>{e.full_name}</td><td>{e.employee_code}</td><td>{e.email || '—'}</td><td>{e.hire_date || '—'}</td><td><span className="tc-badge low">{e.status}</span></td></tr>)}</tbody></table>{employees.length === 0 && <div className="tc-empty">Ainda não existem colaboradores neste tenant.</div>}</section></>;
+}
+
+function Attendance({ locations, anomalies, notify }) {
+  const [selected, setSelected] = useState(locations[0]?.id || ''); const [busy, setBusy] = useState(false); const [last, setLast] = useState(null); const location = locations.find((l) => l.id === selected);
+  useEffect(() => { if (!selected && locations[0]) setSelected(locations[0].id); }, [locations, selected]);
+  const punch = async (eventType) => {
+    if (!location) { notify('Cadastre uma instalação com coordenadas GPS antes de marcar o ponto.', 'error'); return; }
+    setBusy(true);
+    try {
+      const position = await getCurrentPosition();
+      const validation = isInsideGeofence(position, location);
+      if (!validation.ok) { notify(`Picagem bloqueada: ${Math.round(validation.distance || 0)} m do local; raio ${validation.radius} m.`, 'error'); setLast({ ok: false, ...validation }); return; }
+      const { latitude, longitude, accuracy } = position.coords;
+      const result = await rpc('register_time_entry', { p_event_type: eventType, p_work_location_id: location.id, p_latitude: latitude, p_longitude: longitude, p_gps_accuracy: accuracy, p_device: navigator.userAgent.slice(0, 160) });
+      setLast({ ok: true, distance: validation.distance, result }); notify(`${eventType === 'CLOCK_IN' ? 'Entrada' : 'Saída'} registada com validação GPS.`);
+    } catch (error) { console.error(error); notify(explainGeofenceError(error), 'error'); }
+    finally { setBusy(false); }
+  };
+  return <><section className="tc-hero"><div><div className="tc-eyebrow"><MapPin size={13} /> Ponto & Geofence</div><h1>Marcação segura</h1><p>A validação é feita duas vezes: no dispositivo e no PostgreSQL. Fora do raio, o banco rejeita a operação.</p></div></section><div className="tc-clock"><section className="tc-card tc-clock-card"><label className="tc-form">Instalação<select value={selected} onChange={(e) => setSelected(e.target.value)}>{locations.map((l) => <option key={l.id} value={l.id}>{l.name} · {l.gps_radius_m} m</option>)}</select></label><div className="tc-clock-value">{new Date().toLocaleTimeString('pt-PT', { hour: '2-digit', minute: '2-digit' })}</div><div className="tc-actions"><button className="tc-btn primary" disabled={busy} onClick={() => punch('CLOCK_IN')}><CheckCircle2 size={16} /> Entrada</button><button className="tc-btn" disabled={busy} onClick={() => punch('CLOCK_OUT')}><LogOut size={16} /> Saída</button></div>{last && <div className="tc-geofence" style={{ marginTop: 14 }}>{last.ok ? <CheckCircle2 className="tc-ok" size={17} /> : <X className="tc-no" size={17} />} {last.distance != null ? `${Math.round(last.distance)} m do ponto autorizado.` : 'Validação GPS concluída.'}</div>}</section><section className="tc-card tc-card-pad"><div className="tc-section-head"><div><h2>Instalações autorizadas</h2><span>{locations.length} locais ativos</span></div></div>{locations.map((l) => <div className="tc-row" key={l.id}><div className="tc-row-main"><div className="tc-row-title">{l.name}</div><div className="tc-row-sub">{l.address || 'Morada não definida'} · raio {l.gps_radius_m} m</div></div><MapPin size={16} className="tc-muted" /></div>)}{locations.length === 0 && <div className="tc-empty">Sem instalações com GPS configurado.</div>}</section></div><section className="tc-section"><div className="tc-section-head"><div><h2>Sinais recentes</h2><span>atrasos, saídas antecipadas e extras</span></div></div><div className="tc-list">{anomalies.slice(0, 10).map((a) => <div className="tc-row" key={a.id}><div><div className="tc-row-title">{a.work_date}</div><div className="tc-row-sub">{minutes(a.overtime_minutes)} extra · {a.late_minutes || 0} min atraso · {a.early_leave_minutes || 0} min saída antecipada · {a.night_minutes || 0} min noite</div></div><span className={`tc-badge ${(a.late_minutes || a.early_leave_minutes) ? 'high' : 'medium'}`}>{a.status}</span></div>)}</div></section></>;
+}
+
+function Tasks({ tasks, employees, companyId, userId, notify, onReload }) {
+  const [title, setTitle] = useState(''); const [priority, setPriority] = useState('NORMAL'); const [assignee, setAssignee] = useState('');
+  const create = async (e) => { e.preventDefault(); if (!title.trim()) return; const { error } = await supabase.from('hr_tasks').insert({ company_id: companyId, title: title.trim(), priority, assignee_id: assignee || null, created_by: userId }); if (error) notify(error.message, 'error'); else { setTitle(''); notify('Tarefa criada.'); onReload(); } };
+  const setStatus = async (task, status) => { const { error } = await supabase.from('hr_tasks').update({ status }).eq('id', task.id).eq('company_id', companyId); if (error) notify(error.message, 'error'); else { notify('Tarefa atualizada.'); onReload(); } };
+  const columns = [['PENDING', 'Pendentes'], ['IN_PROGRESS', 'Em andamento'], ['DONE', 'Concluídas']];
+  return <><section className="tc-hero"><div><div className="tc-eyebrow"><CheckCircle2 size={13} /> Central RH</div><h1>Tarefas</h1><p>Kanban operacional com auditoria automática de alterações de estado.</p></div></section><section className="tc-card tc-card-pad"><form className="tc-actions" onSubmit={create}><input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Ex.: validar documentos de onboarding" style={{ flex: 1, minWidth: 220, background: '#09111d', border: '1px solid rgba(255,255,255,.09)', color: '#fff', borderRadius: 10, padding: 10 }} /><select value={priority} onChange={(e) => setPriority(e.target.value)} className="tc-btn"><option>LOW</option><option>NORMAL</option><option>HIGH</option><option>URGENT</option></select><select value={assignee} onChange={(e) => setAssignee(e.target.value)} className="tc-btn"><option value="">Sem responsável</option>{employees.map((e) => <option key={e.id} value={e.user_id || ''}>{e.full_name}</option>)}</select><button className="tc-btn primary"><Plus size={15} /> Criar</button></form></section><div className="tc-kanban tc-section">{columns.map(([status, label]) => <section className="tc-column" key={status}><h3>{label} · {tasks.filter((t) => t.status === status).length}</h3>{tasks.filter((t) => t.status === status).map((task) => <div className="tc-task" key={task.id}><strong>{task.title}</strong><small>{task.priority} · {task.category}</small>{task.due_at && <small>Prazo: {new Date(task.due_at).toLocaleString('pt-PT')}</small>}<div className="tc-task-actions">{status === 'PENDING' && <button className="tc-btn tc-small" onClick={() => setStatus(task, 'IN_PROGRESS')}>Iniciar</button>}{status === 'IN_PROGRESS' && <button className="tc-btn primary tc-small" onClick={() => setStatus(task, 'DONE')}><Check size={13} /> Concluir</button>}{status === 'DONE' && <span className="tc-muted">Auditado</span>}</div></div>)}</section>)}</div></>;
+}
+
+function Alerts({ alerts, employees }) { const map = useMemo(() => new Map(employees.map((e) => [e.id, e.full_name])), [employees]); return <><section className="tc-hero"><div><div className="tc-eyebrow"><AlertTriangle size={13} /> Inteligência</div><h1>Alertas preditivos</h1><p>O motor cruza jornadas, horas, saldo de férias, documentos e padrões de absentismo.</p></div></section><section className="tc-card tc-card-pad">{alerts.length === 0 ? <div className="tc-empty">Nenhum alerta aberto.</div> : alerts.map((a) => <div className="tc-alert" key={a.id}><div style={{ flex: 1 }}><div className="tc-alert-title">{a.title}</div><div className="tc-alert-msg">{a.message}{map.get(a.employee_id) ? ` · ${map.get(a.employee_id)}` : ''}</div></div><div style={{ textAlign: 'right' }}><span className={`tc-badge ${String(a.severity).toLowerCase()}`}>{a.severity}</span><div className="tc-muted" style={{ marginTop: 6 }}>{a.score ?? 0}/100</div></div></div>)}</section></>;
+}
+
+function Payroll({ runs }) { return <><section className="tc-hero"><div><div className="tc-eyebrow"><CalendarDays size={13} /> Folha</div><h1>Folha de processamento</h1><p>Estrutura pronta para cálculo, aprovação e exportação sem trazer a complexidade do ERP para a UI.</p></div></section><section className="tc-card tc-card-pad"><table className="tc-table"><thead><tr><th>Período</th><th>Estado</th><th>Colaboradores</th><th>Bruto</th><th>Extra</th><th>Noite</th><th>Líquido</th></tr></thead><tbody>{runs.map((r) => <tr key={r.id}><td>{String(r.period_month).padStart(2, '0')}/{r.period_year}</td><td>{r.status}</td><td>{r.employee_count}</td><td>{money(r.gross_cents)}</td><td>{money(r.overtime_cents)}</td><td>{money(r.night_cents)}</td><td>{money(r.net_cents)}</td></tr>)}</tbody></table>{runs.length === 0 && <div className="tc-empty">Ainda não existem processamentos de folha.</div>}</section></>;
+}
+
+function Shifts({ shifts, assignments, employees }) { const emp = useMemo(() => new Map(employees.map((e) => [e.id, e.full_name])), [employees]); const shift = useMemo(() => new Map(shifts.map((s) => [s.id, s])), [shifts]); return <><section className="tc-hero"><div><div className="tc-eyebrow"><Target size={13} /> Turnos</div><h1>Escalas e jornadas</h1><p>Turnos diurnos/noturnos, tolerância, pausas e rotações ficam no motor; o RH vê só o que precisa decidir.</p></div></section><section className="tc-card tc-card-pad"><div className="tc-section-head"><div><h2>Turnos ativos</h2><span>{shifts.length} configurações</span></div></div>{shifts.map((s) => <div className="tc-row" key={s.id}><div><div className="tc-row-title">{s.name} {s.night_shift && '· Noturno'}</div><div className="tc-row-sub">{s.start_time} → {s.end_time} · pausa {s.break_minutes} min · tolerância {s.tolerance_minutes} min · dias {(s.work_days || []).join(', ')}</div></div><span className="tc-badge low">{s.rotation_code || 'FIXO'}</span></div>)}{shifts.length === 0 && <div className="tc-empty">Nenhum turno ativo. A estrutura está pronta para receber escalas.</div>}<div className="tc-section-head" style={{ marginTop: 18 }}><div><h2>Atribuições</h2><span>{assignments.length} registos</span></div></div>{assignments.slice(0, 20).map((a) => <div className="tc-row" key={a.id}><div><div className="tc-row-title">{emp.get(a.employee_id) || 'Colaborador'}</div><div className="tc-row-sub">{shift.get(a.shift_id)?.name || 'Turno'} · {a.start_date}{a.end_date ? ` → ${a.end_date}` : ''}</div></div></div>)}</section></>;
+}
+
+function Integrations() { return <><section className="tc-hero"><div><div className="tc-eyebrow"><Zap size={13} /> Background Integrations</div><h1>Integrações</h1><p>SAP, PHC, Primavera e Oracle não aparecem como telas de ERP. O Teconnect trabalha com filas, eventos e workers em segundo plano.</p></div></section><div className="tc-grid-6" style={{ gridTemplateColumns: 'repeat(4,1fr)' }}>{['SAP', 'PHC', 'Primavera', 'Oracle'].map((name) => <div className="tc-card tc-kpi" key={name}><div className="tc-kpi-top"><span>{name}</span><Zap size={15} /></div><div className="tc-kpi-value" style={{ fontSize: 20 }}>Worker</div><div className="tc-kpi-foot">fila + webhook assíncrono</div></div>)}</div><section className="tc-card tc-card-pad tc-section"><div className="tc-geofence"><ShieldCheck size={17} className="tc-ok" /><span>O utilizador trabalha no Teconnect. A integração é desacoplada por <strong>event_bus → integration_jobs → Edge Function</strong>.</span></div></section></>;
+}
+
+function CommandPalette({ onClose, onNavigate }) { useEffect(() => { const fn = (e) => { if (e.key === 'Escape') onClose(); }; window.addEventListener('keydown', fn); return () => window.removeEventListener('keydown', fn); }, [onClose]); return <div onClick={onClose} style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,.6)', zIndex: 30, display: 'grid', placeItems: 'start center', paddingTop: 90 }}><div className="tc-card" onClick={(e) => e.stopPropagation()} style={{ width: 'min(620px, calc(100% - 30px))', padding: 12 }}><div className="tc-muted" style={{ padding: 10 }}>Ir para…</div>{pages.map(([id, label, Icon]) => <button key={id} className="tc-btn ghost" style={{ width: '100%', justifyContent: 'flex-start' }} onClick={() => onNavigate(id)}><Icon size={16} /> {label}</button>)}</div></div>; }
