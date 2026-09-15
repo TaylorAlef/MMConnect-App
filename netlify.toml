@@ -5,6 +5,7 @@
 [build.environment]
   NODE_VERSION = "20"
 
+# Keep Vite SPA routes alive on hard refresh while letting real assets resolve normally.
 [[redirects]]
   from = "/*"
   to = "/index.html"
@@ -19,3 +20,10 @@
     Permissions-Policy = "camera=(), microphone=(), geolocation=()"
     Cross-Origin-Opener-Policy = "same-origin"
     Cross-Origin-Resource-Policy = "same-site"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    Content-Security-Policy = "default-src 'self'; connect-src 'self' https://*.supabase.co wss://*.supabase.co; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public,max-age=31536000,immutable"
